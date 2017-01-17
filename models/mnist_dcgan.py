@@ -1,13 +1,14 @@
 import numpy as np
 
-from keras.models import Sequential, Model
+from keras.models import Sequential, Model, load_model
 from keras.layers import Input, Dense, Reshape
-from keras.layers.core import Activation, Flatten
+from keras.layers.core import Activation, Flatten, Dropout
 from keras.layers.advanced_activations import LeakyReLU
 from keras.layers.normalization import BatchNormalization
 from keras.layers.convolutional import Convolution2D, Deconvolution2D
 from keras.optimizers import SGD, Adam
 from keras.datasets import mnist
+from keras.utils.generic_utils import Progbar
 
 class MNIST_DCGAN:
     def __init__(self, z_dim):
@@ -17,7 +18,7 @@ class MNIST_DCGAN:
         self.generator = None
 
     def _generator(self):
-        return Sequential([
+        net = Sequential([
             Dense(1024, input_shape=(self.z_dim,), input_dim=self.z_dim, init='glorot_normal'),
             BatchNormalization(),
             LeakyReLU(alpha=0.3),
@@ -31,18 +32,26 @@ class MNIST_DCGAN:
             Deconvolution2D(1, 5, 5, output_shape=(None, 28, 28, 1), subsample=(2,2), border_mode='same'),
             Activation('tanh')
         ])
+        latent = Input(shape=(self.z_dim, ))
+        fake_image = net(latent)
+        return Model(input=latent, output=fake_image)
 
     def _discriminator(self):
-        return Sequential([
+        net = Sequential([
             Convolution2D(self.nf, 5, 5, input_shape=(28, 28, 1), subsample=(2,2), border_mode='same', init='glorot_normal'),
+            BatchNormalization(),
             LeakyReLU(alpha=0.2),
             Convolution2D(self.nf * 2, 5, 5, subsample=(2,2), border_mode='same', init='glorot_normal'),
             BatchNormalization(),
             LeakyReLU(alpha=0.2),
             Flatten(),
-            Dense(1, init='glorot_normal'),
+            Dense(1),
             Activation('sigmoid')
         ])
+        image = Input(shape=(28, 28, 1))
+        prediction = net(image)
+        return Model(input=image, output=prediction)
+
 
     def _GAN(self, generator, discriminator):
         return Sequential([
@@ -59,10 +68,23 @@ class MNIST_DCGAN:
 
         return data
 
+    def load_saved(self, path):
+        self.generator = load_model(path)
+
+    def generate(self, latents):
+        #images = self._load_dataset()[:latents.shape[0]]
+        images = self.generator.predict(latents)
+        images = images.astype('float32') * 255.0/2 + 255.0/2
+        images = np.array([
+            r.reshape(-1, 28)
+            for r in np.split(images, latents.shape[0])
+        ])
+        return images
+
     def train(self, batch_size, epochs, before_epoch=None, after_epoch=None):
         # Initialize optimizers and models
-        adam = Adam(lr=0.0003)
-        sgd = SGD(lr=0.003)
+        adam = Adam(lr=0.0003, beta_1=0.5)
+        sgd = SGD(lr=0.0005, momentum=0.8)
 
         generator = self.generator = self._generator()
         discriminator = self._discriminator()
@@ -70,7 +92,7 @@ class MNIST_DCGAN:
 
         # NOTE GAN advice: Adam for Generator, vanilla SGD for Discriminator
         generator.compile(loss='binary_crossentropy', optimizer=adam, metrics=['accuracy'])
-        discriminator.compile(loss='binary_crossentropy', optimizer=SGD, metrics=['accuracy'])
+        discriminator.compile(loss='binary_crossentropy', optimizer=sgd, metrics=['accuracy'])
 
         discriminator.trainable = False
         GAN.compile(loss='binary_crossentropy', optimizer=adam, metrics=['accuracy'])
@@ -88,31 +110,25 @@ class MNIST_DCGAN:
             if before_epoch is not None:
                 before_epoch(epoch)
 
+            progress_bar = Progbar(batches)
+
             for i in range(batches):
                 # NOTE GAN advice: Sample latent vectors from a Unit Gaussian instead of Uniform
                 latents = np.random.normal(0, 1, size=(batch_size, self.z_dim))
                 # Sample images from the Generator
-                samples = generator.predict(latents)
+                samples = generator.predict(latents, verbose=False)
                 # Sample images from the Dataset
                 reals = dataset[np.random.randint(dataset_size, size=batch_size)]
-                # Create labeled dataset for the Discriminator and GAN
-                X = np.concatenate((samples, reals), axis=0)
-                Y = np.concatenate((np.zeros(batch_size).astype(int), np.ones(batch_size).astype(int)), axis=0)
-                rand = np.arange(len(X))
-                np.random.shuffle(rand)
-                X = X[rand]
-                Y = Y[rand]
-                Z = np.ones(batch_size).astype(int)
                 # Train Discriminator
-                discriminator.trainable = True
-                loss_d = discriminator.train_on_batch(X, Y)
+                loss_d = discriminator.train_on_batch(samples, np.zeros(batch_size).astype(int))
+                loss_d = discriminator.train_on_batch(reals, np.ones(batch_size).astype(int))
                 # Train Generator
-                discriminator.trainable = False
-                loss_g = GAN.train_on_batch(latents, Z)
+                #latents = np.random.normal(0, 1, size=(batch_size * 2, self.z_dim))
+                loss_g = GAN.train_on_batch(latents, np.ones(batch_size).astype(int))
 
                 loss_discriminator.append(loss_d)
                 loss_gan.append(loss_g)
-
+                progress_bar.update(i)
 
             if after_epoch is not None:
                 after_epoch(epoch, loss_gan=loss_g, loss_discriminator=loss_d)
